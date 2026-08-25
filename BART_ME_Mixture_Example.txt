@@ -1,0 +1,587 @@
+##############################################################################################################################
+# BART with Berkson-Classical Mixture Measurement Error (BART-ME Mixture) Example: 2000 individuals and the following model.
+#
+# Outcome Model:
+#
+# Y = f(X) - 0.05*Z1 + Z2 + e, e~N(0,2),
+#
+# where Z1~Uniform(18,40), Z2~Bernoulli(0.5), 
+#
+# f(X) = 42 - 0.008(X1-65)^2 - 0.015(X2-20)^2 - 0.002(X3-80)^2.
+#
+# X=(X1, X2, X3)~N(mu_x, Sigma_x), mu_x=(65, 20, 75), and Sigma_x defined to have
+# marginal variances (140, 12, 155) and pairwise correlations = 0.9.
+#
+# Mixture Measurement Error Model:
+#
+# Latent intermediate L~N(mu_L, Sigma_L), mu_L=(65, 20, 80) and Sig_L defined
+# to have marginal variances (140, 12, 155) and pairwise correlations = 0.95.
+#
+# Berkson: X = L + U_b, U_b~N(0, Sigma_b)
+# Classical: W_j = L + U_{c,j}, U_{c,j}~N(0, Sigma_c)
+#
+# 50% of sample has replicate measurements of error-prone observations of X, W_j
+#
+# Classical covariance matrix Sigma_c defined to have marginal variances 
+# (6, 1, 3) and pairwise correlations (-0.02, 0.02, 0.25).
+#
+# The proportion of Berkson error is gamma_b=0.50 for all exposure variables;
+# the total measurement error covariance matrix is given by  
+# Sigma_T = Sigma_c / (1-gamma_b); and the Berkson measurement error covariance
+# is defined as Sigma_b = gamma_b*Sigma_T.
+#
+#########################################################################################################################
+
+# Load necessary R packages
+library(mvtnorm)
+library(dbarts)
+library(MCMCpack)
+
+#############################################################
+n <- 2000                ## number of observations
+m <- 50                  ## number of trees for BART fit
+G <- 10000               ## number of Gibbs iterates
+
+## Generate latent intermediate variables, L
+k <- 3                               ### number of exposure variables
+muL.t <- c(65, 20, 80)               ### marginal means
+sig2L.t <- c(140, 12, 155)           ### marginal variances
+delta <- 0.95                        ### pairwise correlations 
+SigL.t <- matrix(0,nrow=3,ncol=3)
+for (j in 1:3){
+  for (k in 1:3){
+    if (j==k){
+      SigL.t[j,k]=sig2L.t[j]
+    } else {
+      SigL.t[j,k]=delta*sqrt(sig2L.t[j])*sqrt(sig2L.t[k])
+    }
+  }
+}
+L.t <- rmvnorm(n,mean=muL.t,sigma=SigL.t)
+
+## Generate classical measurement error covariance matrix, Sigma_c
+sig2c.t <- c(6,1,3)
+rhou.t <- c(-0.02, 0.02, 0.25)
+Sigc.t <- matrix(0,nrow=3,ncol=3)
+idu <- 1
+for (j in 1:3){
+  for (k in j:3){
+    if (j==k){
+      Sigc.t[j,k]=sig2c.t[j]
+    } else {
+      covjk=rhou.t[idu]*sqrt(sig2c.t[j])*sqrt(sig2c.t[k])
+      Sigc.t[j,k]=covjk
+      Sigc.t[k,j]=covjk
+      idu=idu+1
+    }
+  }
+}
+
+### Generate total and Berkson measurement error covariance matrices,
+### with 50% of total error being Berkson error
+gamb.t <- 0.50                ### Berkson proportion
+SigT.t <- Sigc.t/(1-gamb.t)   ### Total error covariance
+Sigb.t <- gamb.t*SigT.t       ### Berkson error covariance
+
+### Generate true (unobserved) exposures with Berkson error
+X.l <- lapply(1:n,function(i){
+  Xi=rmvnorm(1,L.t[i,],Sigb.t)
+})
+X.t <- matrix(unlist(X.l),ncol=k,byrow=TRUE)
+
+### True underlying function relating X to outcome Y
+f.t <- 42 - 0.008 * (X.t[,1] - 65)^2 - 0.015 * (X.t[,2] - 20)^2 - 0.002 * (X.t[,3] - 80)^2
+
+### Generate classical error-prone observed 
+### replicate measurements of true exposures
+r <- sample(1:2,n,replace=TRUE, prob=c(0.50,0.50))   ### 50% of sample have replicates (duplicates)
+W.l <- lapply(1:n,function(i){
+  Wi=rmvnorm(r[i],L.t[i,],Sigc.t)
+  Wi
+})
+
+### Generate error-free adjustment covariates
+p <- 2                            ## number of error-free covariates
+Z <- cbind(runif(n,18,40),rbinom(n,1,0.5))
+beta.t <- c(-0.05, 0.15)          ## model coefficients associated with Z
+
+### Residual error variance
+sig2.e.t <- 2
+
+### Generate outcome
+Y.t <- as.vector(f.t+Z%*%beta.t+rnorm(n,0,sqrt(sig2.e.t)))
+
+
+#############################################################
+### 
+### Fit BART-ME Mixture Model with m=50 trees
+###
+#############################################################
+
+### -----------------------------------
+## Initialize parameters
+### -----------------------------------
+
+### Coefficients associated 
+### with error-free covariates 
+beta <- rep(0,p)
+tau2.beta <- 10000
+
+### Berkson proportion
+a.gam <- 1
+b.gam <- 1
+gam.b <- 0.50
+
+### Total measurement
+### error covariance 
+sum.S <- matrix(0,k,k)
+df.total <- 0
+for (i in 1:n){
+  Wi=W.l[[i]]
+  ni=r[i]
+  
+  if (ni>=2){
+    Wi.bar=colMeans(Wi)
+    wi.bar.mat=matrix(Wi.bar, nrow = ni, ncol = length(Wi.bar), byrow = TRUE)
+    Si=t(Wi-wi.bar.mat)%*%(Wi-wi.bar.mat)
+    sum.S=sum.S+Si
+    df.total=df.total+(ni-1)
+  }
+}
+Sig.within <- sum.S/df.total
+a.T <- 2  
+V0.T <- a.T*Sig.within  ### Scale matrix parameter
+m0.T <- k + 2           ### Degrees of freedom parameter   
+Sig.T <- V0.T
+
+### Berkson measurement
+### error covariance
+Sig.b <- gam.b*Sig.T
+
+### Classical measurement
+### error covariance
+Sig.c <- (1 - gam.b)*Sig.T
+
+### Mean parameter for
+### latent intermediate
+### variables
+muL <- sapply(1:k,function(j){
+  wbar=rep(-99,n)
+  for (i in 1:n){
+    Wij=W.l[[i]][,j]
+    wbar[i]=mean(Wij)
+  }
+  mean(wbar)
+})
+tau2.muL <- 10000
+
+### Covariance matrix for
+### latent intermediate 
+### variables
+Wbar.mat <- do.call(rbind, lapply(W.l, colMeans))
+V0.L <- cov(Wbar.mat)   ### Scale matrix parameter
+m0.L <- k + 2           ### Degrees of freedom parameter    
+Sig.L <- V0.L
+
+### Latent intermediate variables
+L.l <- lapply(1:n,function(i){
+  Wi=W.l[[i]]
+  apply(Wi,2,mean)
+})
+L <- matrix(unlist(L.l),ncol=k,byrow=TRUE)
+
+### Latent true exposures
+X.l <- lapply(1:n,function(i){
+  Wi=W.l[[i]]
+  apply(Wi,2,mean)
+})
+X <- matrix(unlist(X.l),ncol=k,byrow=TRUE)
+colnames(X) <- paste0("X",1:k)
+
+### Save dataset for BART
+Ystar <- Y.t - Z%*%beta
+Ystar <- as.vector(Ystar)
+train <- data.frame(cbind(Ystar,X))
+names(train)[1] <- "Y.t"
+
+### We only need to draw one 
+### sample at a time, so create 
+### a control object for BART
+control <- dbartsControl(updateState = FALSE, verbose = FALSE, 
+                         n.burn = 0L, n.samples = 1L, n.thin = 1L, 
+                         n.chains = 1L, n.trees = m)  
+
+### Create the BART sampler 
+sampler <- dbarts(Y.t~.,train,control=control)
+
+### run first iteration of BART
+samples <- sampler$run()
+f <- rowMeans(samples$train)   ### Initialize exposure-response function
+sig2.e <- samples$sigma**2     ### Initialize residual variance
+
+
+### -----------------------------------
+## Saving devices
+### -----------------------------------
+f.mcmc <- matrix(-99,nrow=G,ncol=n)
+sig2.e.mcmc <- rep(-99,G)
+beta.mcmc <- matrix(-99,nrow=G,ncol=p)
+gam.b.mcmc <- rep(-99,G)
+Sig.T.mcmc <- array(data=-99,c(k,k,G))
+Sig.L.mcmc <- array(data=-99,c(k,k,G))
+muL.mcmc <- matrix(-99,nrow=G,ncol=k)
+L.mcmc <- array(data=-99,c(n,k,G))
+X.mcmc <- array(data=-99,c(n,k,G))
+Y.mcmc <- matrix(-99,nrow=G,ncol=n)
+var.mcmc <- matrix(-99,nrow=G,ncol=k)
+
+### Proposal covariance matrix for
+### Metropolis-Hastings update
+### of latent true exposures, X
+hx.l <- lapply(1:n,function(i){
+  hx=rep(-99,k)
+  for (j in 1:k){
+    hx[j]=0.5*sd(X[,j])
+  }
+  hx
+})
+Hx.l <- lapply(1:n,function(i){
+  diag(hx.l[[i]])
+})
+
+### Tracking Metropolis-Hastings
+### acceptance rate of X
+acc.x <- rep(0, n)
+
+### Proposal standard deviation for 
+### Metropolis-Hastings update
+### of Berkson proportion, gamma_b
+s.eta <- sqrt(0.25)
+
+### Tracking Metropolis-Hastings
+### acceptance rate of Berkson
+### proportion, gamma_b
+acc.gam <- 0
+
+### -----------------------------------
+## For posterior updates that can be
+## stored outside of Gibbs sampler
+### -----------------------------------
+mstar.T <- m0.T + sum(r) + n
+mstar.L <- m0.L + n
+ZtZ <- t(Z)%*%Z
+
+##################################################
+###############################
+### GIBBS SAMPLER STARTS HERE
+for (g in 1:G){
+  
+  ################################
+  ##### MH-STEP TO UPDATE X
+  Zb <- as.vector(Z%*%beta)
+  
+  X.new.l <- lapply(1:n,function(i){
+    Xi=X[i,]
+    Hxi=Hx.l[[i]]
+    Xi.new=rmvnorm(1,mean=as.vector(Xi),sigma=as.matrix(Hxi))
+    as.vector(Xi.new)
+  })
+  X.new <- matrix(unlist(X.new.l),ncol=k,byrow=TRUE)
+  colnames(X.new) <- paste0("X",1:k)
+  f.new <- sampler$predict(X.new)
+  
+  log.ratio <- sapply(1:n,function(i){
+    Yi=Y.t[i]
+    Wi=W.l[[i]]
+    Li=L[i,]
+    
+    log_num = dnorm(Yi, f.new[i]+Zb[i], sqrt(sig2.e), log = TRUE) +
+      dmvnorm(X.new[i,], mean=Li, sigma=as.matrix(Sig.b), log=TRUE)
+    
+    log_denom = dnorm(Yi, f[i]+Zb[i], sqrt(sig2.e), log = TRUE) +
+      dmvnorm(X[i,], mean=Li, sigma=as.matrix(Sig.b), log=TRUE) 
+    
+    log_num - log_denom
+  })
+  
+  u <- runif(n)
+  exam <- (log(u)<=log.ratio) & !is.na(log.ratio)
+  temp.l <- lapply(1:n,function(i){
+    if (exam[i]==TRUE){
+      temp=X.new[i,]
+    } else {
+      temp=X[i,]
+    }
+    temp
+  })
+  X <- matrix(unlist(temp.l),ncol=k,byrow=TRUE)
+  acc.x <- acc.x+exam
+  sampler$setPredictor(x = X, column=c(1:k), forceUpdate = TRUE)
+  
+  ##### Update trees
+  samples <- sampler$run()
+  f <- rowMeans(samples$train)
+  
+  ##### Update sig2.e
+  sig2.e <- samples$sigma**2
+  
+  ##### Recover variable freq counts
+  count <- samples$varcount
+  
+  ##### Update beta
+  Vb <- solve((1/sig2.e)*ZtZ+(1/tau2.beta)*diag(p))
+  mb <- Vb%*%((1/sig2.e)*t(Z)%*%(Y.t-f))
+  beta <- as.vector(rmvnorm(1,mean=as.vector(mb),sigma=as.matrix(Vb)))
+  
+  ##### Recover predicted Y
+  Y <- f + Z%*%beta + rnorm(n,0,sqrt(sig2.e))
+  Y <- as.vector(Y)
+  
+  ##### Update response for BART
+  Ystar <- Y.t-Z%*%beta
+  Ystar <- as.vector(Ystar)
+  sampler$setResponse(Ystar)
+  
+  ################################
+  ##### MH-STEP TO UPDATE gamma_b
+  Sig.T.inv <- solve(Sig.T)
+  
+  S.b <- Reduce('+',lapply(1:n,function(i){
+    Xi=X[i,]
+    Li=L[i,]
+    (Xi-Li)%*%t(Xi-Li)
+  }))
+  A.b <- sum(diag(Sig.T.inv%*%S.b))
+  
+  S.c <- Reduce('+', lapply(1:n,function(i){
+    Li=L[i,]
+    Wi=W.l[[i]]
+    Si=matrix(0,nrow=k,ncol=k)
+    for (j in 1:r[i]){
+      add=(Wi[j,]-Li)%*%t(Wi[j,]-Li)
+      Si=Si+add
+    }
+    Si
+  }))
+  A.c <- sum(diag(Sig.T.inv%*%S.c))
+  
+  eta <- qlogis(gam.b)
+  eta.new <- rnorm(1,eta,s.eta)
+  gam.b.new <- plogis(eta.new)
+  
+  logpost.new <- (a.gam-1-(n*k/2))*log(gam.b.new) + 
+    (b.gam - 1 - (sum(r)*k/2))*log(1-gam.b.new) - 
+    A.b/(2*gam.b.new) - A.c/(2*(1-gam.b.new))
+  
+  logpost.current <- (a.gam-1-(n*k/2))*log(gam.b) + 
+    (b.gam - 1 - (sum(r)*k/2))*log(1-gam.b) - 
+    A.b/(2*gam.b) - A.c/(2*(1-gam.b))
+  
+  log.ratio <- logpost.new - logpost.current + 
+    log(gam.b.new*(1-gam.b.new)) - log(gam.b*(1-gam.b))
+  
+  u <- runif(1)
+  if (is.finite(log.ratio) && log(u) <= log.ratio) {
+    gam.b <- gam.b.new
+    acc.gam <- acc.gam + 1
+  }
+  
+  ##### Update Sig.T
+  Vstar.T <- V0.T + (1/gam.b)*S.b + (1/(1-gam.b))*S.c
+  Sig.T=riwish(mstar.T, Vstar.T)
+  
+  ##### Recover Sig.b
+  Sig.b <- gam.b*Sig.T
+  
+  ##### Recover Sig.c
+  Sig.c <- (1-gam.b)*Sig.T
+  
+  ##### Update Sig.L
+  S.L<-Reduce('+', lapply(1:n, function(i){
+    Li=L[i,]
+    (Li-muL)%*%t(Li-muL)
+  }))
+  Vstar.L <- V0.L+S.L
+  Sig.L <- riwish(mstar.L,Vstar.L)
+  
+  ##### Update muL
+  Sigi.L <- solve(Sig.L)
+  VL <- solve(n*Sigi.L + (1/tau2.muL)*diag(k))
+  mL <- VL%*%Sigi.L%*%colSums(L)
+  muL <- as.vector(rmvnorm(1,mean=as.vector(mL),sigma=as.matrix(VL)))
+  
+  ##### Update L
+  Sigi.b <- solve(Sig.b)
+  Sigi.c <- solve(Sig.c)
+  Sigi.L <- solve(Sig.L)
+  L.l <- lapply(1:n,function(i){
+    Xi=X[i,]
+    Wi=W.l[[i]]
+    ri=r[i]
+    
+    VL.i=solve(Sigi.b + ri*Sigi.c + Sigi.L)
+    mL.i=VL.i%*%(Sigi.b%*%Xi + Sigi.c%*%colSums(Wi) + Sigi.L%*%muL)
+    
+    Li=rmvnorm(1,mean=as.vector(mL.i),sigma=as.matrix(VL.i))
+    Li
+  })
+  L <- matrix(unlist(L.l),ncol=k,byrow=TRUE)
+  
+  ##### Update random walk parameters
+  if (ceiling(g/100)==floor(g/100) & g <= 5000){
+    hx.l <- lapply(1:n,function(i){
+      hxi=hx.l[[i]]
+      for (j in 1:k){
+        hxi[j] <- ifelse(acc.x[i]>40, hxi[j] + 0.1*hxi[j],
+                         ifelse(acc.x[i]<20, hxi[j] - 0.1*hxi[j], hxi[j]))
+      }
+      hxi
+    })
+    Hx.l <- lapply(1:n,function(i){
+      hxi=hx.l[[i]]
+      Hxi=diag(hxi)
+      Hxi
+    })
+    acc.x <- rep(0,n)
+    
+    
+    s.eta <- ifelse(acc.gam>40, s.eta*1.1,
+                    ifelse(acc.gam<20, s.eta/1.1, s.eta))
+    acc.gam <- 0
+  }
+  
+  ##### Store
+  f.mcmc[g,] <- f
+  sig2.e.mcmc[g] <- sig2.e
+  beta.mcmc[g,] <- beta
+  gam.b.mcmc[g] <- gam.b
+  Sig.T.mcmc[,,g] <- Sig.T
+  Sig.L.mcmc[,,g] <- Sig.L
+  muL.mcmc[g,] <- muL
+  L.mcmc[,,g] <- L
+  X.mcmc[,,g] <- X
+  Y.mcmc[g,] <- Y
+  var.mcmc[g,] <- count
+  
+  print(g)
+}
+### GIBBS SAMPLER ENDS HERE
+###############################
+##################################################
+
+
+#############################################################
+### Analyze model results using last half of MCMC chain
+burn <- 5001:G
+
+f <- apply(f.mcmc[burn,], 2, mean)                             ## posterior mean estimates of function 
+f.ci <- apply(f.mcmc[burn,], 2, quantile, probs=c(.025,.975))  ## 95% credible interval
+
+gam.b <- mean(gam.b.mcmc[burn])                                ## posterior mean estimate of Berkson proportion
+gam.b.sd <- sd(gam.b.mcmc[burn])                               ## posterior standard deviation estimate
+
+Sig.T <- apply(Sig.T.mcmc[,,burn], c(1,2), mean)               ## posterior mean estimates of total error covariance
+Sig.T.sd <- apply(Sig.T.mcmc[,,burn], c(1,2), sd)              ## posterior standard deviation estimates
+
+varcount <- var.mcmc[burn,]
+percount <- varcount/apply(varcount,1,sum)
+vip <- apply(percount,2,mean)                                  ## variable inclusion proportions (use smaller # of trees to analyze variable importance)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
